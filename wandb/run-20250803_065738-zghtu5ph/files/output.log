@@ -1,0 +1,15 @@
+/home/timothygao/minRL/.venv/lib/python3.11/site-packages/pygame/pkgdata.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import resource_stream, resource_exists
+Traceback (most recent call last):
+  File "/home/timothygao/minRL/testing.py", line 4, in <module>
+    from reinforce import rollout, SEED  # adjust import to your module path
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/timothygao/minRL/reinforce.py", line 64, in <module>
+    params = pi.init(key, preprocess(env.render()))
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/timothygao/minRL/reinforce.py", line 49, in __call__
+    x = S[..., None]
+        ~^^^^^^^^^^^
+TypeError: list indices must be integers or slices, not tuple
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
