@@ -27,12 +27,14 @@ wandb.init(
       "rollouts_per_epoch": 50,
       "max_steps": 500,
       "learning_rate": 1e-6,
-      "temperature": 1.8,
+      "temperature": 1,
+      "beta": 0.9,
     }
 )
 
 config = wandb.config
 
+@jax.jit
 def preprocess(img_np: np.ndarray, out: int = 64) -> jnp.ndarray:
     gray = np.dot(img_np[..., :3], [0.299, 0.587, 0.114])
     gray = jnp.asarray(gray, dtype=jnp.float32) / 255.0
@@ -51,21 +53,13 @@ class PI(nn.Module):
         x = x.reshape((x.shape[0], -1))
         for h in (self.latent_dim,192,96,72):
             x = nn.Dense(h)(x); x = nn.gelu(x)
-        return nn.log_softmax(nn.Dense(2)(x))
+        return nn.Dense(2)(x)
 
-env = gym.make("CartPole-v1", render_mode="rgb_array")
-key = jax.random.PRNGKey(SEED)
-
-env.reset(seed=SEED)
-
-pi = PI()
-params = pi.init(key, preprocess(env.render())[None, :])
-
-def baseline(state, extra_info):
-    pass
+def baseline(states, extra_info):
+    return np.average(extra_info['rewards']) # a better baseline is previous pole angle
 
 def compute_adv(rewards, extra_info):
-    beta = extra_info["beta"] # reduces variance at cost of bias
+    beta = config.beta # reduces variance at cost of bias
     
     for i in range(len(rewards)-2, -1, -1): # reward to-go
         rewards[i] += beta * rewards[i+1]
@@ -86,7 +80,7 @@ def rollout(key, env):
     S, A, R = [], [], []
     
     for t in range(config.max_steps):
-        S.append(state)
+        S.append(state[0])
         
         # get action
         logits = pi.apply(params, state[0][None, :]).squeeze()
@@ -109,61 +103,60 @@ def rollout(key, env):
     
     return {"states": S, "actions": A, "rewards" : R}
         
+@jax.jit
+def loss(states, acts, adv, model, params):
+    states, acts, adv = jnp.asarray(states), jnp.asarray(acts), jnp.asarray(adv) # convert to jnp arrays
+    logits = model.apply(params, states) # pi(s)
+    log_probs = nn.log_softmax(logits) # pi(s) -> log p(*|s)
+    log_probs = jnp.take_along_axis(log_probs, acts[:, None], axis=1).squeeze() # log p(*|s) -> log p(a|s)
+    res = log_probs * adv # log p(a|s) -> adv * log p(a|s)
+    return jnp.mean(res) # 1/N * sum(adv * log p(a|s))
 
 
+if __name__ == '__main__':
+    env = gym.make("CartPole-v1", render_mode="rgb_array")
+    key = jax.random.PRNGKey(SEED)
+    env.reset(seed=SEED)
+    pi = PI()
+    params = pi.init(key, preprocess(env.render())[None, :])
+    lr = config.learning_rate
 
+    dloss_dparams = jax.grad(loss, argnums=4)
 
-# for epoch in trange(1, config.epochs + 1):
-#     for rollout in range(1, config.rollouts_per_epoch + 1):
+    # grad_params E_traj[return] = E_traj[grad_params log P(traj) * return] 
+    # --> E_step[grad_params log P(a | s) * return] --> E_step[grad_params log P(a | s) * adv] (rewards to-go + baseline)
+    for epoch in trange(1, config.epochs + 1):
+        S, A, R = [], []
         
-        
-        
-        
+        # 1) trajectory monte carlo sampling
+        for sample in range(1, config.rollouts_per_epoch + 1): 
+            episode = rollout(key, env)
+            key = nxt_key(key)
+            episode['rewards'] = compute_adv(episode['rewards'])
+            S.extend(episode['states']) # retrieve all images from state
+            A.extend(episode['actions'])
+            R.extend(episode['rewards'])
             
-#             logits = logp_apply(params, img_obs)[0]
-#             action = int(jax.random.categorical(subkey, logits))
-            
-#             total_reward += reward
-            
-#             tot_samples += 1
-
-#             # compute grad & accumulate
-#             grad = grad_fn(params, img_obs, action)
-#             gn = float(pytree_norm(grad))
-#             grad_norms.append(gn)
-#             grad_sum = jax.tree_util.tree_map(operator.add, grad_sum, grad)
-#             left_fracs.append(float(action == 0))
-#             step_cnt += 1
-#             if done or truncated:
-#                 alive_times.append(step_cnt)
-#                 break
+            if (epoch * config.rollouts_per_epoch + sample) % 100 == 0:
+                video = np.stack(episode['states']).astype(np.uint8)
+                wandb.log({"rollout_video": wandb.Video(video, fps=30, format="mp4")}, step=epoch)
         
-#         epoch_grad_sum = jax.tree_util.tree_map(lambda a, b: a * total_reward + b, grad_sum, epoch_grad_sum)
+        # 2) update policy
+        adv = R - baseline(S, {"rewards":R}) # substract mean reward from episode
+        
+        grad = dloss_dparams(S, A, adv, pi, params)
+        
+        params = jax.tree_util.tree_map(lambda u, v: u + lr * v, params, grad) # take direction of gradient step to maximize loss
+        
+        # 3) logging
+        stats = {
+            "alive_time": len(S) / config.rollouts_per_epoch,
+            "avg_reward": np.mean(R),
+            "var_reward": np.variance(R),
+            "left_percentage" : A.count(0) / len(A),
+            "epoch": epoch,
+        }
+        wandb.log(stats, step=epoch)
 
-#     params = jax.tree_util.tree_map(lambda p,g: p - g / tot_samples,
-#                                     params, epoch_grad_sum)
-
-#     stats = {
-#       "alive_time": np.mean(alive_times),
-#       "alive_variance": np.var(alive_times),
-#       "frac_action_left": np.mean(left_fracs),
-#       "grad_norm": np.mean(grad_norms),
-#       "epoch": epoch,
-#     }
-    
-#     wandb.log(stats, step=epoch)
-
-#     if epoch % 100 == 0:
-#         frames = []
-#         obs = env.reset()[0]
-#         for _ in range(200):
-#             frames.append(env.render())
-#             img_obs = preprocess(frames[-1])
-#             rng_key, subkey = jax.random.split(rng_key)
-#             action = int(jax.random.categorical(subkey, logp_apply(params, img_obs)[0]))
-#             obs, *_ = env.step(action)
-#         video = np.stack(frames).astype(np.uint8)
-#         wandb.log({"rollout_video": wandb.Video(video, fps=30, format="mp4")}, step=epoch)
-
-# env.close()
-# wandb.finish()
+    env.close()
+    wandb.finish()
