@@ -7,10 +7,29 @@ import jax, jax.numpy as jnp
 import jax.image as jimage
 from flax import linen as nn
 from tqdm import trange
+from multiprocessing.pool import Pool
+from PIL import Image
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+os.environ["SDL_AUDIODRIVER"] = "headless"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-SEED = 42
+'''
+Solving the CartPole-v1 with only image observations
+
+The main challenge is low signal to noise ratio
+
+Vanilla Policy Gradient with variance reduction techniques:
+- Discounted rewards
+- Rewards to-go
+- Mean baseline
+
+We wish to compute grad_params E_traj[return]
+-> E_traj[grad_params log P(traj) * return] 
+-> E_step[grad_params log P(a | s) * return]
+-> E_step[grad_params log P(a | s) * (future discounted rewards - baseline(previous states & actions))]
+
+gives an unbiased estimator disregarding constant factors
+'''
 
 wandb.init(
     entity="timothy-gao",
@@ -18,38 +37,45 @@ wandb.init(
     # mode="offline", 
     # dir="/home/timothygao/SpinningUp/plots",
     config={
-      "epochs": 100000,
-      "rollouts_per_epoch": 200,
+      "epochs": 10000,
+      "rollouts_per_epoch": 256,
       "max_steps": 500,
-      "learning_rate": 1e-2,
-      "temperature": 0.5,
-      "beta": 0.99,
-      "history_frames": 2,
-      "record_freq": 5000,
+      "lr": 1e-2,
+      "discount": 0.99,
+      "n_frames": 2,
+      "epoch_record_freq": 5000,
+      "seed": 42,
+      "img_size": 64,
     }
 )
 
 config = wandb.config
 
 @jax.jit
-def preprocess(img_np, out: int = 64):
-    gray = jnp.dot(img_np[..., :3], jnp.array([0.299, 0.587, 0.114]))
-    gray = jnp.asarray(gray, dtype=jnp.float32) / 255.0
-    gray = jimage.resize(gray, (out, out), method="linear", antialias=True)
-    return gray
+def preprocess(img, out=config.img_size):
+    img = jimage.resize(img, (out, out, 1), method='nearest')
+    img = (img - 127.5) / 255.0
+    return img
+
+def discount_rewards(rewards):
+    for i in range(len(rewards)-2, -1, -1): # reward to-go
+        rewards[i] += config.discount * rewards[i+1]
+    return rewards
+
+def compute_reward(prev_state, action, next_state):
+    return 1
 
 class PI(nn.Module):
     latent_dim: int = 256
+    
     @nn.compact
     def __call__(self, S):
         assert(len(S.shape)>=3)
-            
-        if len(S.shape) == 3:
-            S = S[None, :, :, :] # add channel dim
         
-        # print(S.shape) # B, H, W, C
+        if len(S.shape) == 3: # Add batch dim
+            S = S[None, :, :, :] # B, H, W, C
         
-        for f in (32,64):
+        for f in (32,64): 
             S = nn.Conv(f,(4,4),(2,2),padding="SAME")(S)
             S = nn.relu(S)
         
@@ -61,72 +87,37 @@ class PI(nn.Module):
         
         return nn.Dense(2)(S)
 
-def baseline(states, extra_info=None):
-    return jnp.mean(extra_info['rewards']) # a better baseline is previous pole angle
-
-def compute_adv(rewards, extra_info=None):
-    beta = config.beta # reduces variance at cost of bias (TODO: GAE)
-    
-    for i in range(len(rewards)-2, -1, -1): # reward to-go
-        rewards[i] += beta * rewards[i+1]
-    
-    return rewards
-
-def rad_to_deg(x):
-    import math
-    return x / (2 * math.pi) * 360
-
-def get_pole_angle(obs):
-    return rad_to_deg(obs[2])
-
-def compute_reward(s, a, s_nxt):
-    # print(get_pole_angle(s[1]))
-    # print("Reward", abs(get_pole_angle(s[1])) - abs(get_pole_angle(s_nxt[1])))
-    
-    # return -abs(get_pole_angle(s_nxt[1]))
-    # return abs(get_pole_angle(s[1])) - abs(get_pole_angle(s_nxt[1]))
-    return 1
-
-# returns traj = {states, actions, rewards}
-def rollout(key, env):
-    if env == None:
-        env = gym.make("CartPole-v1", render_mode="rgb_array")
-    
-    obs, info = env.reset()
+def rollout(key, env): # returns a single traj = [states, actions, rewards]
+    env = env or gym.make("CartPole-v1", render_mode="rgb_array") # create new env if none passed in
+    obs, info = env.reset(seed=int(jax.random.randint(key, (), 0, 2**31 - 1)))
     state = preprocess(env.render()), obs
     
-    buffer = [state[0] for _ in range(config.history_frames)]
+    buffer = [state[0]] * config.n_frames # buffer shape (n_frames, H, W, 1)
     S, A, R = [], [], []
     
     for t in range(config.max_steps):
-        buffer.append(state[0])
-        buffer = buffer[1:]
+        buffer.append(state[0]) # add frame to buffer
+        buffer = buffer[1:] # only keep the most recent n_frames
+
+        S.append(jnp.concat(buffer, axis=2)) # (n_frames, H, W, 1) -> (H, W, n_frames)
         
-        # print("Before", jnp.asarray(buffer).shape)
-        S.append(jnp.stack(jnp.asarray(buffer), axis=2))
-        
-        # print("Input", S[-1].shape)
-        
-        # get action
-        logits = pi.apply(params, S[-1]).squeeze()
-        key, subkey = jax.random.split(key, 2)
-        action = int(jax.random.categorical(key=key, logits=logits))
+        logits = pi.apply(params, S[-1]).squeeze() # (1, 2) output -> squeeze -> (2)
+        key, subkey = jax.random.split(key, 2) # split key to sample action
+        action = int(jax.random.categorical(key=subkey, logits=logits)) # jax.random.categorical directly samples from logits
         
         A.append(action)
         
-        # change environment, get next state
-        obs, _, terminated, truncated, info = env.step(action)
-        nxt_state = preprocess(env.render()), obs
+        obs, _, terminated, truncated, info = env.step(action) # apply action, advance environment
+        nxt_state = preprocess(env.render()), obs # get next state
         
-        # compute reward
-        R.append(compute_reward(state, action, nxt_state))
+        R.append(compute_reward(state, action, nxt_state)) # compute reward
         
         if terminated or truncated:
             break
 
         state = nxt_state
 
-    return {"states": S, "actions": A, "rewards" : R}
+    return jnp.asarray(S), jnp.asarray(A), jnp.asarray(discount_rewards(R))
         
 @jax.jit
 def loss(params, states, acts, adv, num_trajs):
@@ -140,60 +131,50 @@ if __name__ == '__main__':
     env = gym.make("CartPole-v1", render_mode="rgb_array")
     env = RecordVideo(env,
         video_folder="/home/timothygao/minRL/videos",
-        name_prefix="rollout",
-        episode_trigger=lambda ep: ep % config.record_freq == 0,
+        name_prefix="epoch",
+        episode_trigger=lambda ep: ep % config.epoch_record_freq == 0,
     )
-    key = jax.random.PRNGKey(SEED)
-    env.reset(seed=SEED)
-    pi = PI()
+    n_rollouts = config.rollouts_per_epoch
     
-    dummy = jnp.zeros((1, 64, 64, config.history_frames), dtype=jnp.float32)
+    key = jax.random.key(config.seed)
+    env.reset(seed=int(jax.random.randint(key, (), 0, 2**31 - 1)))
+    pi = PI()
 
-    params = pi.init(key, dummy)
-    lr = config.learning_rate
-
-    dloss_dparams = jax.value_and_grad(loss, argnums=0)
-
-    # grad_params E_traj[return] = E_traj[grad_params log P(traj) * return] 
-    # --> E_traj[sum over steps (grad_params log P(a | s) * return)] --> E_traj[sum over steps (grad_params log P(a | s) * return)] (rewards to-go + baseline)
+    params = pi.init(key, jnp.zeros((1, config.img_size, config.img_size, config.n_frames)))
+    dloss_dparams = jax.jit(jax.value_and_grad(loss, argnums=0))
+    
+    pool = Pool(os.cpu_count())
+    
     for epoch in trange(1, config.epochs + 1):
         S, A, R = [], [], []
-        returns = []
         
-        key, *subkeys = jax.random.split(key, config.rollouts_per_epoch + 1)
-
-        for sample in trange(config.rollouts_per_epoch):
-            episode = rollout(subkeys[sample], env)
-            episode['rewards'] = compute_adv(episode['rewards'])
-            S.extend(episode['states'])
-            A.extend(episode['actions'])
-            R.extend(episode['rewards'])
-            returns.append(len(episode['states']))
+        # 1) Get monte carlo estimate of E_step[grad_params log P(a | s) * Adv]
+        key, *subkeys = jax.random.split(key, n_rollouts + 1)
+        rollout(key, env) # for recording purposes
         
-        S, A, R = jnp.asarray(S), jnp.asarray(A), jnp.asarray(R) # convert to jnp arrays
+        for s, a, r in pool.imap_unordered(rollout, list(zip(subkeys, [None] * n_rollouts))):
+            S.append(s); A.append(a); R.append(r)
+            
+        S, A, R = jnp.concat(S, axis=0), jnp.concat(A, axis=0), jnp.concat(R, axis=0) # convert to jnp arrays
+        adv = R - jnp.mean(R) # Let's use a simple mean baseline
         
         # 2) update policy
-        adv = R - baseline(S, {"rewards":R}) # substract mean reward from episode
-        # adv = R # we already substracted baseline (current pole angle)
-        
-        prev_value, grad = dloss_dparams(params, S, A, adv, config.rollouts_per_epoch)
-        
-        params = jax.tree_util.tree_map(lambda u, v: u + lr * v, params, grad) # take direction of gradient step to maximize loss
-        
-        nxt_value, grad = dloss_dparams(params, S, A, adv, config.rollouts_per_epoch)
+        prev_value, grad = dloss_dparams(params, S, A, adv, n_rollouts) # computes 
+        params = jax.tree_util.tree_map(lambda u, v: u + config.lr * v, params, grad) # take direction of gradient step to maximize loss
+        nxt_value, grad = dloss_dparams(params, S, A, adv, n_rollouts) # check to make sure nxt_val - prev_val > 0
         
         # 3) logging
         stats = {
             "diff": nxt_value - prev_value,
-            "mean_alive_time": len(S) / config.rollouts_per_epoch,
-            "mean_reward": jnp.mean(R), # estimated mean of distribution over rewards, not grad_params log P(a | s) * adv
-            "var_reward": jnp.var(R) * config.rollouts_per_epoch / (config.rollouts_per_epoch - 1), # estimated variance of ^
-            "std_error_reward": jnp.sqrt(jnp.var(R) / (config.rollouts_per_epoch - 1)),  # estimated std of sample mean (standard error)
-            # Var((X1 + X2 + ... + Xn) / n) = Var(X1) / n. Estimated Var(X1) = E[(R_mean - R)^2] * n/(n-1). Var of esimator -> Var(x1) / (n-1). 
+            "mean_alive_time": len(S) / n_rollouts,
+            "mean_reward": jnp.mean(R),
+            "var_reward": jnp.var(R),
+            "var_return": jnp.sqrt(jnp.var(R) / (n_rollouts - 1)),
             "left_percentage" : jnp.sum(A == 0) / len(A),
             "epoch": epoch,
+            "episode": epoch * n_rollouts,
         }
-        wandb.log(stats, step=epoch)
+        wandb.log(stats, step=epoch * n_rollouts)
 
     env.close()
     wandb.finish()
