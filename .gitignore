@@ -1,4 +1,5 @@
 wandb/
 .venv/
 __pycache__/
-/videos
+videos/
+*.mp4

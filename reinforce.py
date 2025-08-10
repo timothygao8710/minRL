@@ -8,7 +8,7 @@ import jax.image as jimage
 from flax import linen as nn
 from tqdm import trange
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 
 SEED = 42
 
@@ -18,14 +18,14 @@ wandb.init(
     # mode="offline", 
     # dir="/home/timothygao/SpinningUp/plots",
     config={
-      "epochs": 1000,
-      "rollouts_per_epoch": 50,
+      "epochs": 100000,
+      "rollouts_per_epoch": 200,
       "max_steps": 500,
       "learning_rate": 1e-2,
-      "temperature": 0.1,
-      "beta": 0,
-      
-      "record_freq": 1000,
+      "temperature": 0.5,
+      "beta": 0.99,
+      "history_frames": 2,
+      "record_freq": 5000,
     }
 )
 
@@ -42,15 +42,24 @@ class PI(nn.Module):
     latent_dim: int = 256
     @nn.compact
     def __call__(self, S):
-        assert(len(S.shape)==3)
-        x = S[:, :, :, None]
+        assert(len(S.shape)>=3)
+            
+        if len(S.shape) == 3:
+            S = S[None, :, :, :] # add channel dim
+        
+        # print(S.shape) # B, H, W, C
+        
         for f in (32,64):
-            x = nn.Conv(f,(4,4),(2,2),padding="SAME")(x)
-            x = nn.relu(x)
-        x = x.reshape((x.shape[0], -1))
+            S = nn.Conv(f,(4,4),(2,2),padding="SAME")(S)
+            S = nn.relu(S)
+        
+        S = S.reshape((S.shape[0], -1))
+        
         for h in (self.latent_dim,96,72):
-            x = nn.Dense(h)(x); x = nn.relu(x)
-        return nn.Dense(2)(x)
+            S = nn.Dense(h)(S)
+            S = nn.relu(S)
+        
+        return nn.Dense(2)(S)
 
 def baseline(states, extra_info=None):
     return jnp.mean(extra_info['rewards']) # a better baseline is previous pole angle
@@ -63,12 +72,20 @@ def compute_adv(rewards, extra_info=None):
     
     return rewards
 
+def rad_to_deg(x):
+    import math
+    return x / (2 * math.pi) * 360
+
 def get_pole_angle(obs):
-    return obs[2]
+    return rad_to_deg(obs[2])
 
 def compute_reward(s, a, s_nxt):
+    # print(get_pole_angle(s[1]))
+    # print("Reward", abs(get_pole_angle(s[1])) - abs(get_pole_angle(s_nxt[1])))
+    
     # return -abs(get_pole_angle(s_nxt[1]))
-    return abs(get_pole_angle(s[1])) - abs(get_pole_angle(s_nxt[1]))
+    # return abs(get_pole_angle(s[1])) - abs(get_pole_angle(s_nxt[1]))
+    return 1
 
 # returns traj = {states, actions, rewards}
 def rollout(key, env):
@@ -78,13 +95,20 @@ def rollout(key, env):
     obs, info = env.reset()
     state = preprocess(env.render()), obs
     
+    buffer = [state[0] for _ in range(config.history_frames)]
     S, A, R = [], [], []
     
     for t in range(config.max_steps):
-        S.append(state[0])
+        buffer.append(state[0])
+        buffer = buffer[1:]
+        
+        # print("Before", jnp.asarray(buffer).shape)
+        S.append(jnp.stack(jnp.asarray(buffer), axis=2))
+        
+        # print("Input", S[-1].shape)
         
         # get action
-        logits = pi.apply(params, state[0][None, :]).squeeze()
+        logits = pi.apply(params, S[-1]).squeeze()
         key, subkey = jax.random.split(key, 2)
         action = int(jax.random.categorical(key=key, logits=logits))
         
@@ -101,7 +125,7 @@ def rollout(key, env):
             break
 
         state = nxt_state
-    env.close()
+
     return {"states": S, "actions": A, "rewards" : R}
         
 @jax.jit
@@ -110,19 +134,22 @@ def loss(params, states, acts, adv, num_trajs):
     log_probs = nn.log_softmax(logits) # pi(s) -> log p(*|s)
     log_probs = jnp.take_along_axis(log_probs, acts[:, None], axis=1).squeeze() # log p(*|s) -> log p(a|s)
     res = log_probs * adv # log p(a|s) -> adv * log p(a|s)
-    return jnp.sum(res) / num_trajs # 1/|D| * sum(adv * log p(a|s))
+    return jnp.mean(res) # 1/|D| * sum(adv * log p(a|s))
 
 if __name__ == '__main__':
     env = gym.make("CartPole-v1", render_mode="rgb_array")
     env = RecordVideo(env,
         video_folder="/home/timothygao/minRL/videos",
         name_prefix="rollout",
-        step_trigger=lambda step: step % config.record_freq == 0,
+        episode_trigger=lambda ep: ep % config.record_freq == 0,
     )
     key = jax.random.PRNGKey(SEED)
     env.reset(seed=SEED)
     pi = PI()
-    params = pi.init(key, preprocess(env.render())[None, :])
+    
+    dummy = jnp.zeros((1, 64, 64, config.history_frames), dtype=jnp.float32)
+
+    params = pi.init(key, dummy)
     lr = config.learning_rate
 
     dloss_dparams = jax.value_and_grad(loss, argnums=0)
@@ -146,7 +173,8 @@ if __name__ == '__main__':
         S, A, R = jnp.asarray(S), jnp.asarray(A), jnp.asarray(R) # convert to jnp arrays
         
         # 2) update policy
-        # adv = R - baseline(S, {"rewards":R}) # substract mean reward from episode
+        adv = R - baseline(S, {"rewards":R}) # substract mean reward from episode
+        # adv = R # we already substracted baseline (current pole angle)
         
         prev_value, grad = dloss_dparams(params, S, A, adv, config.rollouts_per_epoch)
         
