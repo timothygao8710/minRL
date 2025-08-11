@@ -117,7 +117,7 @@ def rollout(key, env): # returns a single traj = [states, actions, rewards]
 
         state = nxt_state
 
-    return jnp.asarray(S), jnp.asarray(A), jnp.asarray(discount_rewards(R))
+    return S, A, discount_rewards(R)
         
 @jax.jit
 def loss(params, states, acts, adv, num_trajs):
@@ -134,6 +134,7 @@ if __name__ == '__main__':
         name_prefix="epoch",
         episode_trigger=lambda ep: ep % config.epoch_record_freq == 0,
     )
+    
     n_rollouts = config.rollouts_per_epoch
     
     key = jax.random.key(config.seed)
@@ -143,19 +144,19 @@ if __name__ == '__main__':
     params = pi.init(key, jnp.zeros((1, config.img_size, config.img_size, config.n_frames)))
     dloss_dparams = jax.jit(jax.value_and_grad(loss, argnums=0))
     
-    pool = Pool(os.cpu_count())
-    
     for epoch in trange(1, config.epochs + 1):
         S, A, R = [], [], []
         
         # 1) Get monte carlo estimate of E_step[grad_params log P(a | s) * Adv]
-        key, *subkeys = jax.random.split(key, n_rollouts + 1)
-        rollout(key, env) # for recording purposes
-        
-        for s, a, r in pool.imap_unordered(rollout, list(zip(subkeys, [None] * n_rollouts))):
-            S.append(s); A.append(a); R.append(r)
+        key, *subkeys = jax.random.split(key, n_rollouts + 2)
+        rollout(subkeys[-1], env) # for recording purposes
+        for sample in trange(n_rollouts):
+            episode = rollout(subkeys[sample], None)
+            S.append(episode[0])
+            A.append(episode[1])
+            R.append(episode[2])
             
-        S, A, R = jnp.concat(S, axis=0), jnp.concat(A, axis=0), jnp.concat(R, axis=0) # convert to jnp arrays
+        S, A, R = jnp.concat(S, axis=0), jnp.concat(A, axis=0), jnp.concat(R, axis=0)
         adv = R - jnp.mean(R) # Let's use a simple mean baseline
         
         # 2) update policy
