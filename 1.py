@@ -11,7 +11,7 @@ from multiprocessing.pool import Pool
 from PIL import Image
 
 os.environ["SDL_AUDIODRIVER"] = "headless"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 
 '''
 Solving the CartPole-v1 with only image observations
@@ -38,12 +38,12 @@ wandb.init(
     # dir="/home/timothygao/SpinningUp/plots",
     config={
       "epochs": 10000,
-      "rollouts_per_epoch": 256,
+      "rollouts_per_epoch": 64,
       "max_steps": 500,
-      "lr": 1e-2,
+      "lr": 1e-3,
       "discount": 0.99,
       "n_frames": 2,
-      "epoch_record_freq": 5000,
+      "epoch_record_freq": 100,
       "seed": 42,
       "img_size": 64,
     }
@@ -117,7 +117,7 @@ def rollout(key, env): # returns a single traj = [states, actions, rewards]
 
         state = nxt_state
 
-    return S, A, discount_rewards(R)
+    return jnp.asarray(S), jnp.asarray(A), jnp.asarray(discount_rewards(R))
         
 @jax.jit
 def loss(params, states, acts, adv, num_trajs):
@@ -125,7 +125,7 @@ def loss(params, states, acts, adv, num_trajs):
     log_probs = nn.log_softmax(logits) # pi(s) -> log p(*|s)
     log_probs = jnp.take_along_axis(log_probs, acts[:, None], axis=1).squeeze() # log p(*|s) -> log p(a|s)
     res = log_probs * adv # log p(a|s) -> adv * log p(a|s)
-    return jnp.mean(res) # 1/|D| * sum(adv * log p(a|s))
+    return 1 / num_trajs * jnp.sum(res) # 1/|D| * sum(adv * log p(a|s))
 
 if __name__ == '__main__':
     env = gym.make("CartPole-v1", render_mode="rgb_array")
@@ -147,9 +147,9 @@ if __name__ == '__main__':
     for epoch in trange(1, config.epochs + 1):
         S, A, R = [], [], []
         
-        # 1) Get monte carlo estimate of E_step[grad_params log P(a | s) * Adv]
-        key, *subkeys = jax.random.split(key, n_rollouts + 2)
-        rollout(subkeys[-1], env) # for recording purposes
+        # 1) Get monte carlo estimate of raw rollouts
+        key, *subkeys = jax.random.split(key, n_rollouts + 1)
+        rollout(key, env) # for recording purposes
         for sample in trange(n_rollouts):
             episode = rollout(subkeys[sample], None)
             S.append(episode[0])
@@ -159,8 +159,7 @@ if __name__ == '__main__':
         S, A, R = jnp.concat(S, axis=0), jnp.concat(A, axis=0), jnp.concat(R, axis=0)
         adv = R - jnp.mean(R) # Let's use a simple mean baseline
         
-        # 2) update policy
-        prev_value, grad = dloss_dparams(params, S, A, adv, n_rollouts) # computes 
+        prev_value, grad = dloss_dparams(params, S, A, adv, n_rollouts) # computes monte carlo estimate for grad_params E_traj[return]
         params = jax.tree_util.tree_map(lambda u, v: u + config.lr * v, params, grad) # take direction of gradient step to maximize loss
         nxt_value, grad = dloss_dparams(params, S, A, adv, n_rollouts) # check to make sure nxt_val - prev_val > 0
         
