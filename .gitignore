@@ -7,3 +7,5 @@ videos/
 /wandb
 /__pycache__
 /videos
+/images
+images/
