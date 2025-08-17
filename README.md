@@ -2,6 +2,8 @@ A zero-to-hero type repo in Deep RL, building up core algorithms (e.g., PPO, SAC
 
 Each step introduces new techniques building on and motivated by the previous iteration, enabling solving harder and more general problems, faster, better, and more with more stability.
 
+Through working on this repo, my goal is to understand these algorithms better.
+
 TODO: Finish Spinning Up Algos, Brax environments
 
 <img width="1219" height="561" alt="Screenshot 2025-08-15 at 12 52 14 PM" src="https://github.com/user-attachments/assets/c052e9a1-b75b-4d94-b016-b8e9ffb04744" />
