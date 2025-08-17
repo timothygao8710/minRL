@@ -1,4 +1,6 @@
-Minimal JAX Implementation of RL Algorithms in a zero-to-hero style
+A zero-to-hero type repo in Deep RL, building up core algorithms (e.g., PPO, SAC, TD3) step-by-step, starting from basic definitions of policy gradient, Q-learning, etc. 
+
+Each step introduces new techniques building on and motivated by the previous iteration, enabling solving harder and more general problems, faster, better, and more with more stability.
 
 TODO: Finish Spinning Up Algos, Brax environments
 
