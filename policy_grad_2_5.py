@@ -14,43 +14,10 @@ import gymnax
 from gymnax.visualize import Visualizer
 
 os.environ["SDL_AUDIODRIVER"] = "headless"
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 '''
-Solving the CartPole-v1 with only image observations
-
-The main challenge is low signal to noise ratio
-
-Builds on 1_reinforce with:
-- Use value function for baseline (optimal control variate)
-- GAE (higher bias for lower variance) 
-
-For unbiased V, the TD residual a * V(s_i+1) + r_i - V(s_i) is unbiased estimator for a-just advantage (see paper)
-
-Notice sum 0 to T of a^i (a * V(s_i+1) + r_i - V(s_i)) = -V(s_0) + r_0 + a * r_1 + a^2 * r_2 + ... + a^T * r_T + a^T+1 V(s_T+1) 
-
-In practice V is biased,
-
-larger T <-> 
-
-Higher variance (more r_i terms, sum of r.v.'s -> summed variances) & 
-Lower bias (rewards are unbiased, V which contributes bias is more heavily discounted)
-
-Notice that using discounted rewards does the same thing: trades off variance for bias. One clean way to do this is consider the 
-exponentially weight average. The tradeoff is controlled by a decay rate a, instead of hardcoding horizon length.
-
-We do the same thing here, let A(T) = sum 0 to T (a)^i (TD resid_i)
-Then, we take exponentially weight average of A(T)s, with decay rate b. Notice this is still a-just for unbiased V.
-
-b = 0: -V(s_i) + r_0 - a * V(s_i+1)
-
-0 < b < 1: roughly controls horizon length (small constant * 1/(1-b)) / how "far out" / discounted our V is
-
-b = 1: -V(s_i) + r_0 + a * r_1 + a^2 * r_2 + ...
-
-turns out, after multiplying by common factor (1 - b), discounted A(T)s simplifies to a nice clean formula 
-
-sum (ab)^i (Td residual_i)
+Compared to reinforce_2.py, uses gymnax and directly feeds env state into model. As expected, converges faster and to a higher value.
 '''
 
 wandb.init(
@@ -62,7 +29,7 @@ wandb.init(
     config={
       "epochs": 10000,
       "rollouts_per_epoch": 256,
-      "max_steps": 50,
+      "max_steps": 200,
       "lr": 1e-3,
       "a": 0.99, # discount on rewards
       "b": 0.98, # discount on TD residual, used in GAE
@@ -113,7 +80,8 @@ def comp_adv(R, V, a, b): # GAE https://arxiv.org/abs/1506.02438
     # return suf_sum_decay(resids, a * b)
     
     temp = suf_sum_decay(R, a)
-    temp = jnp.mean(temp)
+    temp = temp - jnp.mean(temp)
+    # temp = temp - V
     return temp
 
 @jax.jit
@@ -293,5 +261,4 @@ if __name__ == '__main__':
         
         wandb.log(stats, step=epoch * n_rollouts)
 
-    env.close()
     wandb.finish()
